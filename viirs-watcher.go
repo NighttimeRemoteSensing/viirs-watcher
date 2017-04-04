@@ -3,6 +3,7 @@ package main
 import (
 	pp "./pipeline"
 	"bytes"
+	"fmt"
 	//"encoding/json"
 	"errors"
 	xp "gopkg.in/xmlpath.v2"
@@ -143,17 +144,19 @@ func (w *Watcher) Serve() {
 		s   string
 		res chan bool
 	})
-	for {
-		select {
-		case name := <-w.chput:
-			w.watched[name] = struct{}{}
-		case name := <-w.chremove:
-			delete(w.watched, name)
-		case reqres := <-w.chhas:
-			_, ok := w.watched[reqres.s]
-			reqres.res <- ok
+	go func() {
+		for {
+			select {
+			case name := <-w.chput:
+				w.watched[name] = struct{}{}
+			case name := <-w.chremove:
+				delete(w.watched, name)
+			case reqres := <-w.chhas:
+				_, ok := w.watched[reqres.s]
+				reqres.res <- ok
+			}
 		}
-	}
+	}()
 }
 
 func (w *Watcher) Put(name string) {
@@ -169,6 +172,7 @@ func (w *Watcher) Has(name string) bool {
 		s   string
 		res chan bool
 	}
+	reqres.s = name
 	reqres.res = make(chan bool)
 	w.chhas <- reqres
 	return <-reqres.res
@@ -347,7 +351,8 @@ func main() {
 		log.Printf("Failed to parse config: %v\n", err)
 		os.Exit(1)
 	}
-	go watcher.Serve()
+	fmt.Printf("Directory check period %v\n", period)
+	watcher.Serve()
 	checkTime := time.Now()
 	for {
 		checkTime = watchRoot(watchDir, checkTime)
