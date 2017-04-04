@@ -125,33 +125,57 @@ func Process(mainFile string, reqs []RequiredFile) {
 	}
 }
 
-/*func Process(m10file string) {
-	if !hasNight(m10file) {
-		log.Printf("No night data for %s ignoreing", m10file)
-		return
+type Watcher struct {
+	watched  map[string]struct{}
+	chput    chan string
+	chremove chan string
+	chhas    chan struct {
+		s   string
+		res chan bool
 	}
-	id, err := getId(m10file)
-	if nil != err {
-		log.Printf("ERROR: Processing of %s failed due to %s", m10file, err.Error())
-		return
-	}
-	detfile := filepath.Join(OutputDir, strings.Join([]string{"VNFD", id, version}, "_")) + ".csv"
-	detect := exec.Command(DetectBinary, m10file, "-output", detfile, "-cloud", "0")
-	out, err := detect.Output()
-	if nil != err {
-		log.Printf("ERROR: Detect failed with the following output: %s\n", string(out))
-		return
-	}
-	fitfile := filepath.Join(OutputDir, strings.Join([]string{"VNFF", id, version}, "_")) + ".csv"
-	fit := exec.Command(FitBinary, detfile, "-output", fitfile, "-plot", "1", "-map", "1", "-localmax", "1", "-size", "100", "-font", "10")
-	out, err = fit.Output()
-	if nil != err {
-		log.Printf("ERROR: Fit failed with the following output: %s\n", string(out))
-		return
-	}
+}
 
-	log.Printf("INFO: Processing success %s", m10file)
-}*/
+func (w *Watcher) Serve() {
+	w.watched = make(map[string]struct{})
+	w.chput = make(chan string)
+	w.chremove = make(chan string)
+	w.chhas = make(chan struct {
+		s   string
+		res chan bool
+	})
+	for {
+		select {
+		case name := <-w.chput:
+			w.watched[name] = struct{}{}
+		case name := <-w.chremove:
+			delete(w.watched, name)
+		case reqres := <-w.chhas:
+			_, ok := w.watched[reqres.s]
+			reqres.res <- ok
+		}
+	}
+}
+
+func (w *Watcher) Put(name string) {
+	w.chput <- name
+}
+
+func (w *Watcher) Remove(name string) {
+	w.chremove <- name
+}
+
+func (w *Watcher) Has(name string) bool {
+	var reqres struct {
+		s   string
+		res chan bool
+	}
+	reqres.res = make(chan bool)
+	w.chhas <- reqres
+	return <-reqres.res
+}
+
+// Keeps track of currently watched directories
+var watcher Watcher
 
 func isRequired(s string) (bool, string) {
 	for i := range required {
@@ -222,20 +246,45 @@ func watchRoot(dir string, since time.Time) time.Time {
 	}
 
 	for _, finfo := range finfos {
-		if finfo.ModTime().After(since) {
-			if strings.HasPrefix(finfo.Name(), prefix) {
-				go func(finfo os.FileInfo) {
-					subdir := filepath.Join(dir, finfo.Name(), subDir)
-					if !hasChanged(subdir, 30*time.Second) {
-						watchSub(subdir)
-					} else {
-						log.Printf("DEBUG: sub directory %s has been modified ignoring it for now.\n", subdir)
-					}
-				}(finfo)
-				if finfo.ModTime().After(maxTime) {
-					maxTime = finfo.ModTime()
-				}
+		if !strings.HasPrefix(finfo.Name(), prefix) {
+			// Probably other sattelite data or something
+			continue
+		}
+
+		subdir := filepath.Join(dir, finfo.Name(), subDir)
+		subinfo, err := os.Stat(subdir)
+		if os.ErrNotExist == err {
+			// Directory containing actual files not yet created
+			continue
+		}
+
+		if !subinfo.ModTime().After(since) {
+			// Too old
+			continue
+		}
+
+		if watcher.Has(subdir) {
+			// Already watching it
+			continue
+		}
+
+		// After all the checks it seems like this is one of the directories we
+		// were looking for
+		watcher.Put(subdir)
+
+		go func(subdir string) {
+			for hasChanged(subdir, 30*time.Second) {
+				log.Printf("DEBUG: sub directory %s has been modified ignoring it for now.\n", subdir)
 			}
+			// Finally directory has not been changing for quite a while, thus we will scan it
+			// and process if everything is in order
+			watchSub(subdir)
+			watcher.Remove(subdir)
+		}(subdir)
+
+		if subinfo.ModTime().After(maxTime) {
+			// update time milestone
+			maxTime = subinfo.ModTime()
 		}
 	}
 	return maxTime
@@ -298,6 +347,7 @@ func main() {
 		log.Printf("Failed to parse config: %v\n", err)
 		os.Exit(1)
 	}
+	go watcher.Serve()
 	checkTime := time.Now()
 	for {
 		checkTime = watchRoot(watchDir, checkTime)
