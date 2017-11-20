@@ -3,16 +3,14 @@ package main
 import (
 	pp "./pipeline"
 	"bytes"
-	"fmt"
-	//"encoding/json"
 	"errors"
+	"fmt"
 	xp "gopkg.in/xmlpath.v2"
 	y "gopkg.in/yaml.v2"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
+	fp "path/filepath"
 	"strings"
 	"time"
 )
@@ -64,8 +62,8 @@ var OutputDir = "/output"
 
 var version = "v2.1"
 
-func getId(mainFile string) (string, error) {
-	name := filepath.Base(mainFile)
+func getId(file string) (string, error) {
+	name := fp.Base(file)
 	parts := strings.Split(name, "_")
 	if len(parts) < 6 {
 		return "", UnexpectedName
@@ -74,8 +72,8 @@ func getId(mainFile string) (string, error) {
 
 }
 
-func hasNight(mainFile string) bool {
-	h5dump := exec.Command(H5DumpBinary, "-x", "-A", mainFile)
+func hasNight(file string) bool {
+	h5dump := exec.Command(H5DumpBinary, "-x", "-A", file)
 	out, err := h5dump.Output()
 	if nil != err {
 		log.Printf("WARN: H5Dump failed: %s\n", err.Error())
@@ -100,198 +98,147 @@ func hasNight(mainFile string) bool {
 	return false
 }
 
-func Process(mainFile string, reqs []RequiredFile) {
-	if !hasNight(mainFile) {
-		log.Printf("No night data for %s ignoring", mainFile)
-		return
+type File struct {
+	Name         string
+	Fullpath     string
+	Size         int64
+	LastModified time.Time
+}
+
+type FileGroup struct {
+	Files         map[string]*File
+	LastModified  time.Time
+	Path          string
+	Id            string // VIIRS qualified ID
+	RequiredFound int
+	HasNight      bool
+}
+
+func (fg *FileGroup) AnyChanged() (bool, error) {
+	for _, f := range fg.Files {
+		inf, err := os.Stat(f.Fullpath)
+		if nil != err {
+			return false, err
+		}
+		if inf.ModTime().After(f.LastModified) ||
+			inf.Size() > f.Size {
+			return true, nil
+		}
 	}
-	id, err := getId(mainFile)
-	if nil != err {
-		log.Printf("ERROR: Processing of %s failed due to %s", mainFile, err.Error())
-		return
+	return false, nil
+}
+
+func Process(fg *FileGroup) {
+	for _, f := range fg.Files {
+		if !hasNight(f.Fullpath) {
+			log.Printf("No night data for %s ignoring", fg.Id)
+			return
+		}
+		break
 	}
 	var gctx = make(map[string]interface{})
-	gctx["Id"] = id
+	gctx["Id"] = fg.Id
 	gctx["Version"] = version
 	gctx["OutputDir"] = OutputDir
-	for i := range reqs {
-		gctx[reqs[i].Name] = reqs[i].Path
-		var base = filepath.Base(reqs[i].Path)
-		gctx[reqs[i].Name+"_Name"] = strings.TrimSuffix(base, filepath.Ext(base))
+	for _, f := range fg.Files {
+		gctx[f.Name] = f.Fullpath
+		gctx[f.Name+"_Name"] = strings.TrimSuffix(f.Name, fp.Ext(f.Name))
 	}
 	if err, str := pipeline.Exec(gctx); nil == err {
-		log.Printf("INFO: Processing success %s", mainFile)
+		log.Printf("INFO: Processing success %s", fg.Id)
 	} else {
 		log.Printf("ERROR: Pipeline failed with the following error: %v\n%s", err, str)
 	}
 }
 
-type Watcher struct {
-	watched  map[string]struct{}
-	chput    chan string
-	chremove chan string
-	chhas    chan struct {
-		s   string
-		res chan bool
-	}
-}
-
-func (w *Watcher) Serve() {
-	w.watched = make(map[string]struct{})
-	w.chput = make(chan string)
-	w.chremove = make(chan string)
-	w.chhas = make(chan struct {
-		s   string
-		res chan bool
-	})
-	go func() {
-		for {
-			select {
-			case name := <-w.chput:
-				w.watched[name] = struct{}{}
-			case name := <-w.chremove:
-				delete(w.watched, name)
-			case reqres := <-w.chhas:
-				_, ok := w.watched[reqres.s]
-				reqres.res <- ok
-			}
-		}
-	}()
-}
-
-func (w *Watcher) Put(name string) {
-	w.chput <- name
-}
-
-func (w *Watcher) Remove(name string) {
-	w.chremove <- name
-}
-
-func (w *Watcher) Has(name string) bool {
-	var reqres struct {
-		s   string
-		res chan bool
-	}
-	reqres.s = name
-	reqres.res = make(chan bool)
-	w.chhas <- reqres
-	return <-reqres.res
-}
-
 // Keeps track of currently watched directories
-var watcher Watcher
+type Watcher struct {
+	root     string
+	delay    time.Duration
+	required []string
+	found    map[string]*FileGroup
+	ready    map[string]*FileGroup
+}
 
-func isRequired(s string) (bool, string) {
-	for i := range required {
-		if strings.HasPrefix(s, required[i]) {
-			return true, required[i]
+func NewWatcher(root string, required []string, delay time.Duration) *Watcher {
+	if 0 == delay {
+		delay = 30 * time.Second
+	}
+	return &Watcher{
+		root:     root,
+		delay:    delay,
+		required: required,
+		found:    make(map[string]*FileGroup),
+		ready:    make(map[string]*FileGroup),
+	}
+}
+
+func (w *Watcher) isRequired(s string) (bool, string) {
+	for i := range w.required {
+		if strings.HasPrefix(s, w.required[i]) {
+			return true, w.required[i]
 		}
 	}
 	return false, ""
 }
 
-func hasChanged(f string, to time.Duration) bool {
-	finfo, err := os.Stat(f)
-	if nil != err {
-		log.Printf("Failed to stat file %s", f)
-		return false
-	}
-	osmt := finfo.ModTime()
-	<-time.After(to)
-	finfo, err = os.Stat(f)
-	if nil != err {
-		log.Printf("Failed to stat file %s", f)
-		return false
-	}
-	if osmt.Equal(finfo.ModTime()) {
-		return false
-	}
-	log.Printf("DEBUG: ModTime has changed from %v to %v for %s in %v", osmt, finfo.ModTime(), f, to)
-	return true
-}
-
-func watchSub(dir string) {
-	log.Printf("Watching subdirectory %s", dir)
-	found := 0
-	marked := make(map[string]bool)
-	var mainFile string
-	var requiredFiles []RequiredFile
-	for found != len(required) {
-		finfos, err := ioutil.ReadDir(dir)
-		if nil != err {
-			log.Printf("Failed to read subdirectory %s", dir)
-		}
-		for _, f := range finfos {
-			if rqrd, prefix := isRequired(f.Name()); rqrd {
-				_, ok := marked[f.Name()]
-				requiredFiles = append(requiredFiles, RequiredFile{
-					Name: prefix,
-					Path: filepath.Join(dir, f.Name())})
-				if !ok && !hasChanged(filepath.Join(dir, f.Name()), 3*time.Second) {
-					found += 1
-					log.Printf("Required file %s found", f.Name())
-					marked[f.Name()] = true
-					if strings.HasPrefix(f.Name(), required[0]) {
-						mainFile = filepath.Join(dir, f.Name())
+func (w *Watcher) Watch() error {
+	for {
+		fp.Walk(w.root, func(p string, inf os.FileInfo, err error) error {
+			name := inf.Name()
+			if req, _ := w.isRequired(name); !req {
+				return nil
+			}
+			id, err := getId(name)
+			if nil != err {
+				log.Printf("Failed to extract id for a required file %s\n", p)
+				return nil
+			}
+			if _, ok := w.ready[id]; ok {
+				return nil
+			}
+			grp, ok := w.found[id]
+			if !ok {
+				dir, _ := fp.Split(p)
+				w.found[id] = &FileGroup{
+					Path: dir,
+					Id:   id,
+				}
+				grp = w.found[id]
+			}
+			if len(w.required) == grp.RequiredFound {
+				if changed, err := grp.AnyChanged(); nil != err {
+					log.Printf("Failed to check for group change %s", grp.Id)
+				} else {
+					if !changed {
+						w.ready[grp.Id] = grp
 					}
 				}
 			}
-		}
-		<-time.After(period)
-	}
-	Process(mainFile, requiredFiles)
-}
 
-func watchRoot(dir string, since time.Time) time.Time {
-	maxTime := since
-	finfos, err := ioutil.ReadDir(dir)
-	if nil != err {
-		log.Printf("Failed to read directory %s", dir)
-	}
-
-	for _, finfo := range finfos {
-		if !strings.HasPrefix(finfo.Name(), prefix) {
-			// Probably other sattelite data or something
-			continue
-		}
-
-		subdir := filepath.Join(dir, finfo.Name(), subDir)
-		subinfo, err := os.Stat(subdir)
-		if os.ErrNotExist == err {
-			// Directory containing actual files not yet created
-			continue
-		}
-
-		if !subinfo.ModTime().After(since) {
-			// Too old
-			continue
-		}
-
-		if watcher.Has(subdir) {
-			// Already watching it
-			continue
-		}
-
-		// After all the checks it seems like this is one of the directories we
-		// were looking for
-		watcher.Put(subdir)
-
-		go func(subdir string) {
-			for hasChanged(subdir, 30*time.Second) {
-				log.Printf("DEBUG: sub directory %s has been modified ignoring it for now.\n", subdir)
+			if inf.ModTime().After(grp.LastModified) {
+				grp.LastModified = inf.ModTime()
 			}
-			// Finally directory has not been changing for quite a while, thus we will scan it
-			// and process if everything is in order
-			watchSub(subdir)
-			watcher.Remove(subdir)
-		}(subdir)
 
-		if subinfo.ModTime().After(maxTime) {
-			// update time milestone
-			maxTime = subinfo.ModTime()
-		}
+			f, ok := grp.Files[inf.Name()]
+			if !ok {
+				grp.Files[inf.Name()] = &File{
+					Name:         inf.Name(),
+					Fullpath:     p,
+					Size:         inf.Size(),
+					LastModified: inf.ModTime(),
+				}
+				f = grp.Files[inf.Name()]
+				grp.RequiredFound += 1
+			}
+
+			f.LastModified = inf.ModTime()
+			f.Size = inf.Size()
+
+			return nil
+		})
+		<-time.After(w.delay)
 	}
-	return maxTime
 }
 
 var noConfig = errors.New("No config file provided.")
@@ -346,16 +293,13 @@ func readConfig() error {
 	return nil
 }
 
+var watcher Watcher
+
 func main() {
 	if err := readConfig(); nil != err {
 		log.Printf("Failed to parse config: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Directory check period %v\n", period)
-	watcher.Serve()
-	checkTime := time.Now()
-	for {
-		checkTime = watchRoot(watchDir, checkTime)
-		<-time.After(period)
-	}
+	watcher.Watch()
 }
