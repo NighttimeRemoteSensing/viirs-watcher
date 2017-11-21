@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+var launchTime = time.Now()
+
 var UnexpectedName = errors.New("Name does not satisfy expected pattern.")
 
 var cfg struct {
@@ -99,6 +101,7 @@ func hasNight(file string) bool {
 }
 
 type File struct {
+	Prefix       string
 	Name         string
 	Fullpath     string
 	Size         int64
@@ -141,8 +144,8 @@ func Process(fg *FileGroup) {
 	gctx["Version"] = version
 	gctx["OutputDir"] = OutputDir
 	for _, f := range fg.Files {
-		gctx[f.Name] = f.Fullpath
-		gctx[f.Name+"_Name"] = strings.TrimSuffix(f.Name, fp.Ext(f.Name))
+		gctx[f.Prefix] = f.Fullpath
+		gctx[f.Prefix+"_Name"] = strings.TrimSuffix(f.Name, fp.Ext(f.Name))
 	}
 	if err, str := pipeline.Exec(gctx); nil == err {
 		log.Printf("INFO: Processing success %s", fg.Id)
@@ -183,9 +186,16 @@ func (w *Watcher) isRequired(s string) (bool, string) {
 }
 
 func (w *Watcher) Watch() error {
+	print(w.root)
 	for {
 		fp.Walk(w.root, func(p string, inf os.FileInfo, err error) error {
+			if nil != err {
+				return err
+			}
 			name := inf.Name()
+			if ".h5" != fp.Ext(p) {
+				return nil
+			}
 			if req, _ := w.isRequired(name); !req {
 				return nil
 			}
@@ -201,8 +211,9 @@ func (w *Watcher) Watch() error {
 			if !ok {
 				dir, _ := fp.Split(p)
 				w.found[id] = &FileGroup{
-					Path: dir,
-					Id:   id,
+					Files: make(map[string]*File),
+					Path:  dir,
+					Id:    id,
 				}
 				grp = w.found[id]
 			}
@@ -211,7 +222,14 @@ func (w *Watcher) Watch() error {
 					log.Printf("Failed to check for group change %s", grp.Id)
 				} else {
 					if !changed {
+						log.Printf("Group found %s", grp.Id)
 						w.ready[grp.Id] = grp
+						if grp.LastModified.After(launchTime) {
+							Process(grp)
+						} else {
+							log.Printf("Group %s last modification time %s too old skipping.",
+								grp.Id, grp.LastModified.Format("2006-01-02T15:04:05"))
+						}
 					}
 				}
 			}
@@ -222,7 +240,9 @@ func (w *Watcher) Watch() error {
 
 			f, ok := grp.Files[inf.Name()]
 			if !ok {
+				log.Printf("Found %s", inf.Name())
 				grp.Files[inf.Name()] = &File{
+					Prefix:       strings.Split(inf.Name(), "_")[0],
 					Name:         inf.Name(),
 					Fullpath:     p,
 					Size:         inf.Size(),
@@ -293,13 +313,12 @@ func readConfig() error {
 	return nil
 }
 
-var watcher Watcher
-
 func main() {
 	if err := readConfig(); nil != err {
 		log.Printf("Failed to parse config: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Directory check period %v\n", period)
+	var watcher = NewWatcher(cfg.WatchDir, required, period)
 	watcher.Watch()
 }
