@@ -209,6 +209,9 @@ func (w *Watcher) Watch() error {
 			}
 			grp, ok := w.found[id]
 			if !ok {
+				if inf.ModTime().Before(launchTime) {
+					return nil
+				}
 				dir, _ := fp.Split(p)
 				w.found[id] = &FileGroup{
 					Files: make(map[string]*File),
